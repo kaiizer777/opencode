@@ -135,6 +135,8 @@ const generalSchema = Persistence.struct({
   newQuestionUI: Schema.Boolean,
   // The redesigned session timeline, off until it ships.
   newTimeline: Persistence.optional(Schema.Boolean),
+  // The composer that messages a subagent inside its own Session, off until a user turns it on.
+  subagentComposer: Schema.Boolean,
   // Browser-style session tab grouping across vertical and horizontal tabs.
   tabGroups: Persistence.optional(Schema.Boolean),
   // One side panel open state for every session tab, instead of one per tab.
@@ -316,6 +318,7 @@ export const defaultSettings: Settings = {
     foldUserMessages: false,
     wrapCodeBlocks: false,
     newQuestionUI: false,
+    subagentComposer: false,
     sidebarOrganize: "list",
     mobileTitlebarPosition: "top",
     followUpBehavior: "steer",
@@ -471,6 +474,10 @@ export const { use: useSettings, provider: SettingsProvider } = createSimpleCont
         newQuestionUI: withFallback(() => store.general?.newQuestionUI, defaultSettings.general.newQuestionUI),
         setNewQuestionUI(value: boolean) {
           setStore("general", "newQuestionUI", value)
+        },
+        subagentComposer: withFallback(() => store.general?.subagentComposer, defaultSettings.general.subagentComposer),
+        setSubagentComposer(value: boolean) {
+          setStore("general", "subagentComposer", value)
         },
         sidebarOrganizeOptions,
         sidebarOrganize,

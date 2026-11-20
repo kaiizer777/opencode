@@ -30,34 +30,22 @@ import {
   type SubmitSnapshot,
 } from "./machine"
 import { retryFingerprint } from "./retry"
-import {
-  SERVER_PROMPT_STATUS,
-  transitionPromptStatus,
-  type PromptStatusEvent,
-  type PromptStatusState,
-} from "./prompt-status-machine"
+import { admitPrompt, CANCELLED, type PromptAdmission, type PromptTurn } from "./admission"
 
 // The model each session was last switched to from this client, by session ID.
 const switched = new Map<string, string>()
 
-// The optimistic busy status of each session, by session ID. Module-wide, because a new session's first prompt and
-// the follow-ups sent from its own composer go through different submit machines. A session left out is `server`.
-const statuses = new Map<string, PromptStatusState>()
-
 // Each session's last send, until it has joined the data layer's send chain. A send first builds its request
 // (attachments read, mentions checked), which takes one longer than another, and must still join after the sends made
-// before it. Module-wide for the same reason as `statuses`.
+// before it. Module-wide like the admission's statuses.
 const joining = new Map<string, Promise<void>>()
-
-/** A send's place in its session's order: `before` is the send made before it, until that one has joined the chain. */
-type Turn = { before: Promise<void> | undefined; joined: () => void }
 
 /**
  * Runs one send in its session's order. Call it before the first await. `send` builds its request in whatever time
  * that takes, waits for `before`, puts the request in the data layer's send chain and calls `joined` at once. A send
  * that ends without joining does not hold the next one back.
  */
-function inTurn<T>(sessionID: string, send: (turn: Turn) => Promise<T>) {
+function inTurn<T>(sessionID: string, send: (turn: PromptTurn) => Promise<T>) {
   const mine = Promise.withResolvers<void>()
   const turn = { before: joining.get(sessionID), joined: () => mine.resolve() }
 
@@ -72,17 +60,14 @@ function inTurn<T>(sessionID: string, send: (turn: Turn) => Promise<T>) {
   return sending
 }
 
-/** What a cancelled send fails with: Stop pressed while its request still waited on the gate. */
-const CANCELLED = new Error("The send was cancelled before its request left.")
-
 /**
  * A send's gate. `open` settles once its request may leave, and rejects with `CANCELLED` when `cancel` is called
  * first.
  */
 type Gate = { open: Promise<void>; cancel: () => void }
 
-// The gates each session's sends still wait on, by session ID, until each settles. Module-wide for the same reason as
-// `statuses`: a new session's composer unmounts while its first prompt waits, and a tab switch remounts a session's
+// The gates each session's sends still wait on, by session ID, until each settles. Module-wide like the admission's
+// statuses: a new session's composer unmounts while its first prompt waits, and a tab switch remounts a session's
 // composer, so the composer the person presses Stop in is not always the one that made the send.
 const waiting = new Map<string, Set<Gate>>()
 
@@ -667,21 +652,22 @@ function dispatchPrompt(
 
   const background = value.delivery === "steer" && working ? session.background?.() : undefined
 
-  updateStatus(session, { type: "dispatched", id: value.id, working })
-
-  const sending = sendPrompt(session, value, input.adapter.controls().model.selection.trackSessionCommit, gate).then(
+  const sending = sendPrompt(
+    session,
+    value,
+    input.adapter.controls().model.selection.trackSessionCommit,
+    working,
+    gate,
+  ).then(
     () => ({ ok: true as const }),
     (error) => ({ ok: false as const, error }),
   )
 
   // Settled here rather than when the composer settles, which an aborted promotion never reaches.
   void sending.then((result) => {
-    const admitted = result.ok || session.admitted(value.id)
-    updateStatus(session, admitted ? { type: "admitted" } : { type: "failed", id: value.id })
-
     if (value.delivery !== "steer") return
 
-    if (admitted) return session.handoff.settle(value.id)
+    if (result.ok) return session.handoff.settle(value.id)
     session.handoff.clear(value.id)
   })
 
@@ -701,15 +687,6 @@ function dispatchPrompt(
         return true
       }),
   }
-}
-
-function updateStatus(session: ComposerSession, event: PromptStatusEvent) {
-  const result = transitionPromptStatus(statuses.get(session.id) ?? SERVER_PROMPT_STATUS, event)
-
-  if (result.state.type === "server") statuses.delete(session.id)
-
-  if (result.state.type === "optimistic") statuses.set(session.id, result.state)
-  result.effects.forEach((effect) => session.data.session.setStatus(session.id, effect.status))
 }
 
 /**
@@ -926,18 +903,27 @@ function sendPrompt(
   session: ComposerSession,
   value: ComposerSubmission,
   track: ModelSelection["trackSessionCommit"] | undefined,
+  working: boolean,
   gate: Gate | undefined,
 ) {
-  return inTurn(session.id, (turn) => admitPrompt(session, value, track, gate, turn))
+  return inTurn(session.id, (turn) =>
+    admitPrompt({
+      session,
+      id: value.id,
+      working,
+      turn,
+      admission: preparePrompt(session, value, track, gate),
+    }),
+  )
 }
 
-async function admitPrompt(
+// The prompt's selection brackets the admission itself, so the model switch lands before the server commits it.
+async function preparePrompt(
   session: ComposerSession,
   value: ComposerSubmission,
   track: ModelSelection["trackSessionCommit"] | undefined,
   gate: Gate | undefined,
-  turn: Turn,
-) {
+): Promise<PromptAdmission> {
   const request = await buildSubmissionRequest(session, value)
 
   // Switching agent or model reconfigures the session immediately, and with it
@@ -968,7 +954,7 @@ async function admitPrompt(
   // A retried admission reuses the first commit rather than switching again.
   let committed: Promise<unknown> | undefined
 
-  const admission = {
+  return {
     id: value.id,
     sessionID: session.id,
     delivery: value.delivery,
@@ -992,14 +978,6 @@ async function admitPrompt(
     // plugins prepare, so a send cancelled meanwhile stops here and nothing of it reaches the server.
     prepare: () => (committed ??= (gate?.open ?? Promise.resolve()).then(() => (staged ? undefined : commit()))),
   }
-
-  if (turn.before) await turn.before
-  const sending = session.data.session.prompt(admission)
-
-  turn.joined()
-  // An admission that fails is tried once more. A cancelled one is not: the person stopped it.
-  await sending.catch((error) => (error === CANCELLED ? Promise.reject(error) : session.data.session.prompt(admission)))
-  session.data.session.acceptSend(session.id)
 }
 
 async function buildSubmissionRequest(session: ComposerSession, value: ComposerSubmission) {
